@@ -1,0 +1,22 @@
+{
+    "manifest_version": 2,
+    "name": "Are.na New Tab",
+    "version": "1.0",
+    "description": "Display random Are.na blocks on your new tab page",
+    "icons": {
+        "128": "img/logo.png"
+    },
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "arena-new-tab@example.com",
+            "strict_min_version": "91.0"
+        }
+    },
+    "permissions": [
+        "storage",
+        "https://api.are.na/*"
+    ],
+    "chrome_url_overrides": {
+        "newtab": "tab.html"
+    }
+}
