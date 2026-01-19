@@ -137,18 +137,22 @@ async function fetchRandomBlock(userId) {
     try {
         const channels = await getChannelList(userId);
         if (channels && channels.length > 0) {
-            const randomChannel = getRandom(channels);
-            if (randomChannel && randomChannel.contents && randomChannel.contents.length > 0) {
-                const randomContent = getRandom(randomChannel.contents);
-                const blockResponse = await fetch(`https://api.are.na/v2/blocks/${randomContent.id}`, {
-                    headers: {
-                        "Content-Type": "application/json",
-                        Authorization: `Bearer ${auth.token}`
-                    },
-                });
-                if (!blockResponse.ok) return null;
-                return await blockResponse.json();
+            // Filter to channels that have contents, then pick random
+            const channelsWithContents = channels.filter(c => c.contents && c.contents.length > 0);
+            if (channelsWithContents.length === 0) {
+                console.log('No channels with contents for user', userId);
+                return null;
             }
+            const randomChannel = getRandom(channelsWithContents);
+            const randomContent = getRandom(randomChannel.contents);
+            const blockResponse = await fetch(`https://api.are.na/v2/blocks/${randomContent.id}`, {
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${auth.token}`
+                },
+            });
+            if (!blockResponse.ok) return null;
+            return await blockResponse.json();
         }
         return null;
     } catch (err) {
@@ -171,10 +175,27 @@ function handleBlock(block, type) {
         blockContentElement.className = "max-w-md max-h-96 border border-gray-300 cursor-pointer p-6 overflow-y-auto bg-white";
         blockContentElement.innerHTML = block.content_html;
     } else if (block.image && block.image.large) {
-        blockContentElement = document.createElement('img');
-        blockContentElement.className = "max-w-[30vw] max-h-[70vh] object-contain cursor-pointer";
-        blockContentElement.src = block.image.large.url || block.image.small.url || block.image.thumb.url;
-        blockContentElement.alt = block.title || 'Are.na Block';
+        const imgUrl = block.image.large.url || block.image.small.url || block.image.thumb.url;
+        const isGif = block.image.content_type === 'image/gif' || imgUrl.toLowerCase().includes('.gif');
+
+        if (isGif) {
+            // Freeze GIF on first frame using canvas
+            blockContentElement = document.createElement('canvas');
+            blockContentElement.className = "max-w-[30vw] max-h-[70vh] object-contain cursor-pointer";
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => {
+                blockContentElement.width = img.width;
+                blockContentElement.height = img.height;
+                blockContentElement.getContext('2d').drawImage(img, 0, 0);
+            };
+            img.src = imgUrl;
+        } else {
+            blockContentElement = document.createElement('img');
+            blockContentElement.className = "max-w-[30vw] max-h-[70vh] object-contain cursor-pointer";
+            blockContentElement.src = imgUrl;
+            blockContentElement.alt = block.title || 'Are.na Block';
+        }
     } else {
         blockContentElement = document.createElement('div');
         blockContentElement.className = "flex items-center justify-center text-gray-500 w-96 h-96 border border-gray-300 cursor-pointer p-6 bg-gray-100";
