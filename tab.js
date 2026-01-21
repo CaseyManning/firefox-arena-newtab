@@ -5,8 +5,8 @@ document.addEventListener('DOMContentLoaded', async function () {
     document.getElementById('auth-container').style.display = !auth.token ? 'flex' : 'none';
 
     if (auth.token) {
-        // Clean up old cache format
-        browser.storage.local.remove('cachedBlocks');
+        // Clean up old cache formats
+        browser.storage.local.remove(['cachedBlocks', 'followingCache']);
 
         // Try to show cached blocks first for instant display
         const cached = await browser.storage.local.get(['cachedMyBlock', 'cachedFollowingBlock']);
@@ -43,18 +43,14 @@ async function fetchAndDisplayBlocks() {
         console.error('Error fetching my block:', err);
     }
 
-    // Fetch and display following block (independent of my block)
+    // Fetch and display following block (from followed users' channels + directly followed channels)
     try {
-        const following = await getRandomFollowing(user.id);
-        if (following) {
-            const followingId = following.user_id || following.id;
-            const followingBlock = await fetchRandomBlock(followingId);
-            if (followingBlock) {
-                handleBlock(followingBlock, 'following');
-                await browser.storage.local.set({
-                    cachedFollowingBlock: { block: followingBlock, timestamp: Date.now() }
-                });
-            }
+        const followingBlock = await fetchFollowingBlock(user.id);
+        if (followingBlock) {
+            handleBlock(followingBlock, 'following');
+            await browser.storage.local.set({
+                cachedFollowingBlock: { block: followingBlock, timestamp: Date.now() }
+            });
         }
     } catch (err) {
         console.error('Error fetching following block:', err);
@@ -85,18 +81,14 @@ async function prefetchBlocks() {
     // Prefetch following block (with retry)
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
-            const following = await getRandomFollowing(user.id);
-            if (following) {
-                const followingId = following.user_id || following.id;
-                const followingBlock = await fetchRandomBlock(followingId);
-                if (followingBlock) {
-                    const followingImgUrl = followingBlock?.image?.large?.src || followingBlock?.image?.display?.src || followingBlock?.image?.original?.src;
-                    if (followingImgUrl) preloadImage(followingImgUrl);
-                    await browser.storage.local.set({
-                        cachedFollowingBlock: { block: followingBlock, timestamp: Date.now() }
-                    });
-                    break;
-                }
+            const followingBlock = await fetchFollowingBlock(user.id);
+            if (followingBlock) {
+                const followingImgUrl = followingBlock?.image?.large?.src || followingBlock?.image?.display?.src || followingBlock?.image?.original?.src;
+                if (followingImgUrl) preloadImage(followingImgUrl);
+                await browser.storage.local.set({
+                    cachedFollowingBlock: { block: followingBlock, timestamp: Date.now() }
+                });
+                break;
             }
         } catch (err) {
             console.error(`Error prefetching following block (attempt ${attempt + 1}):`, err);
@@ -128,6 +120,18 @@ async function getUserDetails() {
 function getRandom(items) {
     if (!items || items.length === 0) return null;
     return items[Math.floor(Math.random() * items.length)];
+}
+
+function getWeightedRandom(items, weightFn) {
+    if (!items || items.length === 0) return null;
+    const totalWeight = items.reduce((sum, item) => sum + weightFn(item), 0);
+    if (totalWeight === 0) return null;
+    let random = Math.random() * totalWeight;
+    for (const item of items) {
+        random -= weightFn(item);
+        if (random <= 0) return item;
+    }
+    return items[items.length - 1];
 }
 
 async function getChannelList(userId) {
@@ -285,20 +289,20 @@ function handleBlock(block, type) {
     blocksWrapper.appendChild(wrapper);
 }
 
-async function getFollowingList(userId) {
+async function getFollowingChannelsPool(userId) {
     const ONE_DAY = 24 * 60 * 60 * 1000;
 
-    // Check for cached following list
-    const cached = await browser.storage.local.get('followingCache');
-    if (cached.followingCache) {
-        const { users, timestamp } = cached.followingCache;
-        if (Date.now() - timestamp < ONE_DAY && users && users.length > 0) {
-            return users;
+    // Check for cached pool
+    const cached = await browser.storage.local.get('followingChannelsPoolCache');
+    if (cached.followingChannelsPoolCache) {
+        const { channels, timestamp } = cached.followingChannelsPoolCache;
+        if (Date.now() - timestamp < ONE_DAY && channels && channels.length > 0) {
+            return channels;
         }
     }
 
-    // Fetch fresh following list
     try {
+        // Fetch following list (users + channels)
         const response = await fetch(`https://api.are.na/v3/users/${userId}/following`, {
             headers: {
                 "Content-Type": "application/json",
@@ -307,31 +311,88 @@ async function getFollowingList(userId) {
         });
         if (!response.ok) return null;
         const data = await response.json();
-        // v3 may return users/following array, possibly wrapped in data
         const rawFollowing = data.data || data.following || data.users || data.contents || data || [];
         const following = Array.isArray(rawFollowing) ? rawFollowing : [];
-        if (following.length > 0) {
-            // v3 uses 'type' instead of 'class' or 'base_class'
-            const followedUsers = following.filter(item => item && (item.type === 'User' || item.base_class === 'User' || item.class === 'User'));
-            // Cache the list
+
+        const channelsMap = new Map(); // id -> channel (for deduplication)
+
+        // Add directly followed channels
+        const followedChannels = following.filter(item =>
+            item && (item.type === 'Channel' || item.base_class === 'Channel' || item.class === 'Channel')
+        );
+        for (const channel of followedChannels) {
+            if (channel.id && (channel.counts?.blocks > 0 || channel.counts?.contents > 0)) {
+                channelsMap.set(channel.id, channel);
+            }
+        }
+
+        // Add channels from followed users
+        const followedUsers = following.filter(item =>
+            item && (item.type === 'User' || item.base_class === 'User' || item.class === 'User')
+        );
+        for (const user of followedUsers) {
+            const userChannels = await getChannelList(user.id);
+            if (userChannels) {
+                for (const channel of userChannels) {
+                    if (channel.id && (channel.counts?.blocks > 0 || channel.counts?.contents > 0)) {
+                        channelsMap.set(channel.id, channel);
+                    }
+                }
+            }
+        }
+
+        const uniqueChannels = Array.from(channelsMap.values());
+
+        if (uniqueChannels.length > 0) {
             await browser.storage.local.set({
-                followingCache: { users: followedUsers, timestamp: Date.now() }
+                followingChannelsPoolCache: { channels: uniqueChannels, timestamp: Date.now() }
             });
-            return followedUsers;
+            return uniqueChannels;
         }
         return null;
     } catch (err) {
-        console.error('Error fetching following:', err);
+        console.error('Error building following channels pool:', err);
         return null;
     }
 }
 
-async function getRandomFollowing(userId) {
-    const followedUsers = await getFollowingList(userId);
-    if (followedUsers && followedUsers.length > 0) {
-        return getRandom(followedUsers);
+async function fetchFollowingBlock(userId) {
+    try {
+        const channels = await getFollowingChannelsPool(userId);
+        if (!channels || channels.length === 0) return null;
+
+        // Weight by block count so all blocks have equal probability
+        const randomChannel = getWeightedRandom(channels, c => c.counts?.blocks || c.counts?.contents || 1);
+
+        // Fetch contents from the channel
+        const contentsResponse = await fetch(`https://api.are.na/v3/channels/${randomChannel.slug}/contents?per=100`, {
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${auth.token}`
+            },
+        });
+        if (!contentsResponse.ok) return null;
+        const contentsData = await contentsResponse.json();
+        const contents = contentsData.data || contentsData.contents || [];
+
+        if (contents.length === 0) return null;
+
+        const randomContent = getRandom(contents);
+
+        // Fetch full block details
+        const blockResponse = await fetch(`https://api.are.na/v3/blocks/${randomContent.id}`, {
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${auth.token}`
+            },
+        });
+        if (!blockResponse.ok) return null;
+        const blockData = await blockResponse.json();
+        return blockData.data ? blockData.data[0] : blockData;
+    } catch (err) {
+        console.error('Error fetching following block:', err);
+        return null;
     }
-    return null;
 }
 
 document.getElementById('login').addEventListener('click', async () => {
